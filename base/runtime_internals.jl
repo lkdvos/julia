@@ -1880,8 +1880,8 @@ function may_invoke_generator(method::Method, @nospecialize(atype), sparams::Sim
     generator = method.generator
     firstarg = if isa(generator, Core.GeneratedFunctionStub)
         1
-    elseif isdefinedglobal(@__MODULE__, :JuliaLowering) &&
-            isa(generator, JuliaLowering.GeneratedFunctionStub)
+    elseif isdefinedglobal(Base, :SyntaxGeneratedFunctionStub) &&
+            isa(generator, Base.SyntaxGeneratedFunctionStub)
         2
     else
         return false
