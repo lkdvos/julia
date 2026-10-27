@@ -363,15 +363,6 @@ static inline uint32_t jl_mutex_park_idx(jl_mutex_t *lock) JL_NOTSAFEPOINT
     return (uint32_t)(h & (JL_MUTEX_NPARK - 1));
 }
 
-// The low bit of lock->owner flags that a task may be parked on this lock: a
-// ThunderLock. Release clears the bit and broadcasts the bucket, and the woken
-// waiters re-contend. Tasks are >=16-byte aligned so the bit is free; release
-// swaps owner and reads the flag in one atomic step.
-#define JL_MUTEX_PARKED ((uintptr_t)1)
-#define jl_mutex_owner(w)     ((jl_task_t*)((uintptr_t)(w) & ~JL_MUTEX_PARKED))
-#define jl_mutex_parked(w)    ((uintptr_t)(w) & JL_MUTEX_PARKED)
-#define jl_mutex_with_park(t) ((jl_task_t*)((uintptr_t)(t) | JL_MUTEX_PARKED))
-
 // return calling thread's ID
 JL_DLLEXPORT int16_t jl_threadid(void)
 {

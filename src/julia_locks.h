@@ -11,6 +11,15 @@
 extern "C" {
 #endif
 
+// The low bit of lock->owner flags that a task may be parked on this lock: a
+// ThunderLock. Release clears the bit and broadcasts the bucket, and the woken
+// waiters re-contend. Tasks are >=16-byte aligned so the bit is free; release
+// swaps owner and reads the flag in one atomic step.
+#define JL_MUTEX_PARKED ((uintptr_t)1)
+#define jl_mutex_owner(w)     ((jl_task_t*)((uintptr_t)(w) & ~JL_MUTEX_PARKED))
+#define jl_mutex_parked(w)    ((uintptr_t)(w) & JL_MUTEX_PARKED)
+#define jl_mutex_with_park(t) ((jl_task_t*)((uintptr_t)(t) | JL_MUTEX_PARKED))
+
 // Lock acquire and release primitives
 
 // JL_LOCK and jl_mutex_lock are GC safe points, use uv_mutex_t if that is not desired.

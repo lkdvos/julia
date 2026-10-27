@@ -1716,7 +1716,37 @@ JL_EXTENSION struct _jl_typestack_t {
     struct _jl_typestack_t *prev;
 };
 
+// The instantiation stack of the critical region of `inst_datatype_inner`
+// (under `typecache_lock`) on the task holding the lock, NULL outside one. A
+// lazy supertype computation nested in that region continues from it, so that
+// a type the region is still building is found on the stack by name and
+// parameters instead of being instantiated a second time
+static jl_typestack_t *typecache_stack = NULL;
+
+#ifndef NDEBUG
+// whether `base` is `stack` or one of its tails
+static int typestack_extends(jl_typestack_t *stack, jl_typestack_t *base) JL_NOTSAFEPOINT
+{
+    while (stack != base) {
+        if (stack == NULL)
+            return 0;
+        stack = stack->prev;
+    }
+    return 1;
+}
+#endif
+
+// `typecache_stack` when the current task holds `typecache_lock`, else NULL
+// (it then belongs to another task's region, or to none)
+static jl_typestack_t *typecache_stack_held(void) JL_NOTSAFEPOINT
+{
+    jl_task_t *owner = jl_mutex_owner(jl_atomic_load_relaxed(&typecache_lock.owner));
+    return owner == jl_current_task ? typecache_stack : NULL;
+}
+
 static jl_value_t *inst_type_w_(jl_value_t *t, jl_typeenv_t *env, jl_typestack_t *stack, int check, int nothrow, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT;
+static jl_vararg_t *wrap_vararg_(jl_value_t *t, jl_value_t *n, int check, int nothrow,
+                                 jl_typestack_t *stack, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT;
 static jl_svec_t *inst_ftypes(jl_svec_t *p, jl_typeenv_t *env, jl_typestack_t *stack, int cacheable, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT;
 
 static jl_value_t *instantiate_unionall_(jl_unionall_t *u, jl_value_t *p, jl_deferred_typecache_t *dcache)
@@ -2274,15 +2304,15 @@ static int may_substitute_ub(jl_value_t *v, jl_tvar_t *var) JL_NOTSAFEPOINT
     return _may_substitute_ub(v, var, 0, &cov_count);
 }
 
-static jl_value_t *normalize_unionalls(jl_value_t *t) JL_CANSAFEPOINT
+static jl_value_t *normalize_unionalls(jl_value_t *t, jl_typestack_t *stack, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT
 {
     if (jl_is_uniontype(t)) {
         jl_uniontype_t *u = (jl_uniontype_t*)t;
         jl_value_t *a = NULL;
         jl_value_t *b = NULL;
         JL_GC_PUSH2(&a, &b);
-        a = normalize_unionalls(u->a);
-        b = normalize_unionalls(u->b);
+        a = normalize_unionalls(u->a, stack, dcache);
+        b = normalize_unionalls(u->b, stack, dcache);
         if (a != u->a || b != u->b) {
             t = jl_new_struct(jl_uniontype_type, a, b);
         }
@@ -2290,7 +2320,7 @@ static jl_value_t *normalize_unionalls(jl_value_t *t) JL_CANSAFEPOINT
     }
     else if (jl_is_typeeq(t)) {
         jl_typeeq_t *te = (jl_typeeq_t*)t;
-        jl_value_t *T = normalize_unionalls(te->T);
+        jl_value_t *T = normalize_unionalls(te->T, stack, dcache);
         JL_GC_PUSH1(&T);
         if (T != te->T && jl_typeof(T) == jl_typeof(te->T))
             t = (jl_value_t*)jl_wrap_Type(T);
@@ -2303,7 +2333,7 @@ static jl_value_t *normalize_unionalls(jl_value_t *t) JL_CANSAFEPOINT
     }
     else if (jl_is_unionall(t)) {
         jl_unionall_t *u = (jl_unionall_t*)t;
-        jl_value_t *body = normalize_unionalls(u->body);
+        jl_value_t *body = normalize_unionalls(u->body, stack, dcache);
         JL_GC_PUSH2(&body, &t);
         if (body != u->body) {
             t = jl_new_struct(jl_unionall_type, u->var, body);
@@ -2313,7 +2343,8 @@ static jl_value_t *normalize_unionalls(jl_value_t *t) JL_CANSAFEPOINT
         if (u->var->lb == u->var->ub || may_substitute_ub(body, u->var)) {
             body = (jl_value_t*)u;
             JL_TRY {
-                t = jl_instantiate_unionall(u, u->var->ub);
+                jl_typeenv_t env = { u->var, u->var->ub, NULL };
+                t = inst_type_w_(u->body, &env, stack, 1, 0, dcache);
             }
             JL_CATCH {
                 // just skip normalization
@@ -2326,7 +2357,8 @@ static jl_value_t *normalize_unionalls(jl_value_t *t) JL_CANSAFEPOINT
 }
 
 // used to expand an NTuple to a flat representation
-static jl_value_t *jl_tupletype_fill(size_t n, jl_value_t *t, int check, int nothrow, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT
+static jl_value_t *jl_tupletype_fill(size_t n, jl_value_t *t, int check, int nothrow,
+                                     jl_typestack_t *stack, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT
 {
     jl_value_t *p = NULL;
     JL_GC_PUSH1(&p);
@@ -2341,7 +2373,7 @@ static jl_value_t *jl_tupletype_fill(size_t n, jl_value_t *t, int check, int not
             jl_type_error_rt("Vararg", "type", (jl_value_t*)jl_type_type, t);
         }
         // jl_wrap_vararg sometimes simplifies the type, so we only do this 1 time, instead of for each n later
-        t = normalize_unionalls(t);
+        t = normalize_unionalls(t, stack, dcache);
         p = t;
         jl_value_t *tw = extract_wrapper(t);
         if (tw && t != tw && !jl_has_free_typevars(t) && jl_types_equal(t, tw))
@@ -2350,7 +2382,7 @@ static jl_value_t *jl_tupletype_fill(size_t n, jl_value_t *t, int check, int not
         check = 0; // remember that checks are already done now
     }
     p = (jl_value_t*)jl_svec_fill(n, t);
-    p = jl_apply_tuple_type_v_(jl_svec_data((jl_svec_t*)p), n, (jl_svec_t*)p, check, dcache);
+    p = inst_datatype_inner(jl_anytuple_type, (jl_svec_t*)p, jl_svec_data((jl_svec_t*)p), n, stack, NULL, check, 0, dcache);
     JL_GC_POP();
     return p;
 }
@@ -2467,6 +2499,10 @@ static int typename_occurs_in(jl_value_t *t, jl_typename_t *tn) JL_NOTSAFEPOINT
     return 0;
 }
 
+static jl_value_t *inst_datatype_complete(jl_datatype_t *dt, jl_datatype_t *ndt, jl_typestack_t *stack,
+                                          jl_typeenv_t *env, int check, int nothrow,
+                                          jl_deferred_typecache_t *dcache, int cacheable, int defer) JL_CANSAFEPOINT;
+
 static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value_t **iparams, size_t ntp,
                                        jl_typestack_t *stack, jl_typeenv_t *env, int check, int nothrow,
                                        jl_deferred_typecache_t *dcache)
@@ -2576,7 +2612,8 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
     }
 
     jl_datatype_t *ndt = NULL;
-    JL_GC_PUSH2(&p, &ndt);
+    jl_value_t *res = NULL;
+    JL_GC_PUSH3(&p, &ndt, &res);
 
     jl_value_t *last = iparams[ntp - 1];
     if (istuple && ntp > 0 && jl_is_vararg(last)) {
@@ -2594,7 +2631,7 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
             if (nt == 0 || !jl_has_free_typevars(va0)) {
                 if (ntp == 1) {
                     JL_GC_POP();
-                    return jl_tupletype_fill(nt, va0, 0, 0, dcache);
+                    return jl_tupletype_fill(nt, va0, 0, 0, stack, dcache);
                 }
                 size_t i, l;
                 p = jl_alloc_svec(ntp - 1 + nt);
@@ -2605,7 +2642,7 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
                     jl_svecset(p, i, va0);
                 size_t np = jl_svec_len(p);
                 jl_value_t **pp = jl_svec_data(p);
-                jl_value_t *ndt = inst_datatype_inner(jl_anytuple_type, p, pp, np, NULL, NULL, check, nothrow, dcache);
+                jl_value_t *ndt = inst_datatype_inner(jl_anytuple_type, p, pp, np, stack, NULL, check, nothrow, dcache);
                 JL_GC_POP();
                 return ndt;
             }
@@ -2632,7 +2669,7 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
         size_t i;
         for (i = 0; i < ntp; i++) {
             jl_value_t *pi = iparams[i];
-            jl_value_t *newp = normalize_unionalls(pi);
+            jl_value_t *newp = normalize_unionalls(pi, stack, dcache);
             if (newp != pi) {
                 jl_gc_write(p, iparams[i], jl_value_t, newp);
                 changed = 1;
@@ -2692,29 +2729,11 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
 
     ndt = jl_new_uninitialized_datatype();
 
-    // now that most allocations are done
-    // acquire the write lock now that we know we need a new object
-    // since we're going to immediately leak it globally via the instantiation stack
-    if (cacheable && !defer) {
-        JL_LOCK(&typecache_lock); // Might GC
-        jl_value_t *lkup = (jl_value_t*)lookup_type(tn, iparams, ntp);
-        if (lkup) {
-            JL_UNLOCK(&typecache_lock); // Might GC
-            JL_GC_POP();
-            return lkup;
-        }
-    }
-
     // create and initialize new type
     ndt->isprimitivetype = dt->isprimitivetype;
     // Usually dt won't have ismutationfree set at this point, but it is
     // overridden for `Type`, which we handle here.
     ndt->ismutationfree = dt->ismutationfree;
-    // associate these parameters with the new type on
-    // the stack, in case one of its field types references it.
-    top.tt = (jl_datatype_t*)ndt;
-    top.prev = stack;
-    stack = &top;
     jl_gc_write(ndt, ndt->name, jl_typename_t, tn);
     ndt->super = NULL;
     jl_gc_write(ndt, ndt->parameters, jl_svec_t, p);
@@ -2789,13 +2808,65 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
     }
 
     if (nothrow && invalid) {
-        if (cacheable && !defer)
-            JL_UNLOCK(&typecache_lock);
         JL_GC_POP();
         return NULL;
     }
-    jl_datatype_t *primarydt = ((jl_datatype_t*)jl_unwrap_unionall(tn->wrapper));
     jl_precompute_memoized_dt(ndt, cacheable);
+    // associate these parameters with the new type on
+    // the stack, in case one of its field types references it.
+    top.tt = (jl_datatype_t*)ndt;
+    top.prev = stack;
+    stack = &top;
+    if (cacheable && !defer) {
+        // acquire the write lock now that we know we need a new object
+        // since we're going to immediately leak it globally via the instantiation stack
+        JL_LOCK(&typecache_lock); // Might GC
+        // lend the stack to the lazy supertype computations nested in this
+        // region (`typecache_stack_held`); every exit takes it back, so no
+        // dead frame is ever reachable from the global
+        jl_typestack_t *saved = typecache_stack;
+        // a nested region continues the stack it replaces (every instantiation
+        // hands over its stack), so lazy supertypes still see the outer types
+        assert(typestack_extends(stack, saved));
+        typecache_stack = stack;
+        JL_TRY {
+            res = inst_datatype_complete(dt, ndt, stack, env, check, nothrow, dcache, cacheable, defer);
+        }
+        JL_CATCH {
+            typecache_stack = saved;
+            jl_rethrow();
+        }
+        typecache_stack = saved;
+        JL_UNLOCK(&typecache_lock); // Might GC
+    }
+    else {
+        res = inst_datatype_complete(dt, ndt, stack, env, check, nothrow, dcache, cacheable, defer);
+    }
+    JL_GC_POP();
+    return res;
+}
+
+// Finish `ndt`, which has its name, parameters and memoized flags and sits on
+// top of `stack`: look the key up once more under `typecache_lock` (it was
+// taken for a cacheable, non-deferred type), then compute the layout, the
+// supertype and the field types, and publish. The lookup compares keys by
+// subtyping, which may compute a lazy supertype whose instantiation reaches
+// the key of `ndt` itself; it finds `ndt` on the stack (`typecache_stack`).
+// Returns the cached type if one exists, NULL for a `nothrow` failure, else `ndt`
+static jl_value_t *inst_datatype_complete(jl_datatype_t *dt, jl_datatype_t *ndt, jl_typestack_t *stack,
+                                          jl_typeenv_t *env, int check, int nothrow,
+                                          jl_deferred_typecache_t *dcache, int cacheable, int defer)
+{
+    jl_typename_t *tn = ndt->name;
+    int istuple = (tn == jl_tuple_typename);
+    int isnamedtuple = (tn == jl_namedtuple_typename);
+    if (cacheable && !defer) {
+        jl_svec_t *p = ndt->parameters;
+        jl_value_t *lkup = (jl_value_t*)lookup_type(tn, jl_svec_data(p), jl_svec_len(p));
+        if (lkup)
+            return lkup;
+    }
+    jl_datatype_t *primarydt = ((jl_datatype_t*)jl_unwrap_unionall(tn->wrapper));
     // for deferred instantiations, the layout is computed at publication:
     // the group's types are still incomplete here, and computing it now
     // would bake in wrong assumptions (cf. #40050)
@@ -2815,7 +2886,7 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
     // concrete type must publish with its layout, and only the supertype
     // declaration can force an infinite graph through abstract levels.
     int defer_super = check && !istuple && !isnamedtuple && dt->super != NULL &&
-        typename_on_stack(top.prev, tn) &&
+        typename_on_stack(stack->prev, tn) &&
         typename_occurs_in((jl_value_t*)primarydt->super, tn);
     if (istuple || isnamedtuple) {
         ndt->super = jl_any_type;
@@ -2825,12 +2896,8 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
     }
     else if (dt->super) {
         jl_value_t *super = inst_type_w_((jl_value_t*)dt->super, env, stack, check, nothrow, dcache);
-        if (nothrow && super == NULL) {
-            if (cacheable && !defer)
-                JL_UNLOCK(&typecache_lock);
-            JL_GC_POP();
+        if (nothrow && super == NULL)
             return NULL;
-        }
         jl_gc_write(ndt, ndt->super, jl_datatype_t, (jl_datatype_t *)super);
     }
     jl_svec_t *ftypes = dt->types;
@@ -2874,11 +2941,8 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
             if (ndt->layout == NULL && ndt->types != NULL && ndt->isconcretetype)
                 jl_compute_field_offsets(ndt);
             jl_cache_type_(ndt);
-            JL_UNLOCK(&typecache_lock); // Might GC
         }
     }
-
-    JL_GC_POP();
     return (jl_value_t*)ndt;
 }
 
@@ -2992,7 +3056,7 @@ static jl_value_t *inst_tuple_w_(jl_value_t *t, jl_typeenv_t *env, jl_typestack_
             // Since this is skipping jl_wrap_vararg, we inline the checks from it here
             ssize_t nt = jl_unbox_long(N);
             if (nt >= 0)
-                return jl_tupletype_fill(nt, T, check, nothrow, dcache);
+                return jl_tupletype_fill(nt, T, check, nothrow, stack, dcache);
             if (nothrow)
                 return NULL;
             jl_errorf("Vararg length is negative: %zd", nt);
@@ -3182,7 +3246,7 @@ static jl_value_t *inst_type_w_(jl_value_t *t, jl_typeenv_t *env, jl_typestack_t
             }
         }
         if (t && (T != v->T || N != v->N))
-            t = (jl_value_t*)jl_wrap_vararg(T, N, check, nothrow);
+            t = (jl_value_t*)wrap_vararg_(T, N, check, nothrow, stack, dcache);
         JL_GC_POP();
         return t;
     }
@@ -3310,7 +3374,8 @@ jl_value_t *jl_wrap_TypeEgal(jl_value_t *t)
     return te;
 }
 
-jl_vararg_t *jl_wrap_vararg(jl_value_t *t, jl_value_t *n, int check, int nothrow)
+static jl_vararg_t *wrap_vararg_(jl_value_t *t, jl_value_t *n, int check, int nothrow,
+                                 jl_typestack_t *stack, jl_deferred_typecache_t *dcache)
 {
     int valid = 1;
     jl_vararg_t *vm = NULL;
@@ -3349,7 +3414,7 @@ jl_vararg_t *jl_wrap_vararg(jl_value_t *t, jl_value_t *n, int check, int nothrow
                 valid = 0;
             }
             if (valid) {
-                t = normalize_unionalls(t);
+                t = normalize_unionalls(t, stack, dcache);
                 jl_value_t *tw = extract_wrapper(t);
                 if (tw && t != tw && !jl_has_free_typevars(t) && jl_types_equal(t, tw))
                     t = tw;
@@ -3364,6 +3429,11 @@ jl_vararg_t *jl_wrap_vararg(jl_value_t *t, jl_value_t *n, int check, int nothrow
     }
     JL_GC_POP();
     return vm;
+}
+
+jl_vararg_t *jl_wrap_vararg(jl_value_t *t, jl_value_t *n, int check, int nothrow)
+{
+    return wrap_vararg_(t, n, check, nothrow, NULL, NULL);
 }
 
 static jl_svec_t *compute_fieldtypes_(jl_datatype_t *st JL_PROPAGATES_ROOT, void *stack, int cacheable, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT
@@ -3424,7 +3494,10 @@ JL_DLLEXPORT jl_datatype_t *jl_datatype_compute_super(jl_datatype_t *ndt JL_PROP
         penv[pi].val = jl_svecref(ndt->parameters, pi);
         penv[pi].prev = pi == 0 ? NULL : &penv[pi - 1];
     }
-    jl_typestack_t stop = { ndt, NULL };
+    // nested in an instantiation of the current task (through the subtyping
+    // of a cache lookup), continue its stack: a type that instantiation is
+    // still building is found there instead of being created a second time
+    jl_typestack_t stop = { ndt, typecache_stack_held() };
     jl_value_t *s = inst_type_w_((jl_value_t*)primarydt->super,
                                  nparams == 0 ? NULL : &penv[nparams - 1],
                                  &stop, 1, 0, NULL);
