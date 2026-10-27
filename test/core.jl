@@ -9530,6 +9530,32 @@ let F = DeferredSuperLevels.F, A = DeferredSuperLevels.A
     @test !isdefined(tn, :partial) || all(t -> t === nothing || Base.has_free_typevars(t), tn.partial)
 end
 
+# A supertype is deferred only when its declaration is valid for every
+# parameter: the deferred level is instantiated from inside subtyping, which
+# must not throw. A declaration that can fail is instantiated eagerly, so an
+# invalid level fails at construction.
+module DeferredSuperTotal
+abstract type A{X<:Integer} end
+abstract type C{Y, Z} end
+abstract type D{X, Y<:X} end
+abstract type L{X>:Tuple{}, Y} end
+struct Total{T} <: C{A{Int}, Total{Tuple{T}}} end          # `A{Int}` is checked now; `Total`, `C` have no bounds
+struct Dependent{T} <: D{Any, Dependent{Tuple{T}}} end     # valid, but a dependent bound isn't proven
+struct Partial{T} <: C{A{T}, Partial{Tuple{T}}} end        # `A{Tuple{T}}` is invalid at the next level
+struct Lower{T} <: L{Tuple{Vararg{T}}, Lower{Tuple{T}}} end # valid, but a lower bound isn't proven
+end
+let Total = DeferredSuperTotal.Total, Dependent = DeferredSuperTotal.Dependent,
+    Partial = DeferredSuperTotal.Partial, Lower = DeferredSuperTotal.Lower,
+    A = DeferredSuperTotal.A, C = DeferredSuperTotal.C
+    @test supertype(Total{Int}) === C{A{Int}, Total{Tuple{Int}}}
+    @test !isdefined(Base.inferencebarrier(Total{Tuple{Int}}), :super)  # still deferred
+    @test supertype(Total{Tuple{Int}}) === C{A{Int}, Total{Tuple{Tuple{Int}}}}
+    @test_throws TypeError Partial{Int}          # at construction, not from `supertype(Partial{Tuple{Int}})`
+    @test_throws TypeError Partial{String}
+    @test_throws ErrorException Lower{Int}       # eager, and refused rather than instantiated without end
+    @test_throws ErrorException Dependent{Int}
+end
+
 # Method tables and dispatch caches keep their entries in insertion-ordered dicts that
 # grow by appending. Every entry must stay reachable as a dict grows through many sizes.
 module OrderedDictGrowth
