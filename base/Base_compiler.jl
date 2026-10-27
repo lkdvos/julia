@@ -6,7 +6,7 @@ Core._import(Base, Core, :_eval_import, :_eval_import, true)
 Core._import(Base, Core, :_eval_using, :_eval_using, true)
 
 using .Core.Intrinsics, .Core.IR
-import .Core: VERSION_EDITION, OLDEST_EDITION
+import .Core: OLDEST_EDITION, RELEASE_EDITION, VERSION_EDITION
 
 # to start, we're going to use a very simple definition of `include`
 # that doesn't require any function (except what we can get from the `Core` top-module)

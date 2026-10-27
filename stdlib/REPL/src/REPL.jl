@@ -1242,7 +1242,7 @@ function parse_repl_input_line(line::String, repl; kwargs...)
     # then this does not affect the parser used for that module. We could probably skip this step
     # in that case, but let's just be consistent on the off chance that the active module tries
     # to `include(Main, ...)` or similar.
-    @Base.ScopedValues.with Base.MainInclude.main_parser=>Base.parser_for_active_project() Base.parse_input_line(line;
+    @Base.ScopedValues.with Base.MainInclude.main_parser=>Base.parser_for_active_project(Base.RELEASE_EDITION) Base.parse_input_line(line;
         mod=Base.active_module(repl), type=Syntax, kwargs...)
 end
 

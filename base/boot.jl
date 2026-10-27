@@ -1327,6 +1327,8 @@ include(Core, "optimized_generics.jl")
 const OLDEST_EDITION = (1, 13)
 const VERSION_EDITION =
     (Int(ccall(:jl_ver_major, Int32, ())), Int(ccall(:jl_ver_minor, Int32, ())))
+# The latest edition fit for using by default in interactive settings
+const RELEASE_EDITION = (1, 14)
 
 # Used only by the magic @VERSION macro
 struct MacroSource
