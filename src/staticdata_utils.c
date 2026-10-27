@@ -19,7 +19,6 @@ int must_be_new_dt(jl_value_t *t, htable_t *news, char *image_base, size_t sizeo
 {
     //if (jl_object_in_image(t))
     //    return 0; // fast-path for rejection
-    assert(ptrhash_get(news, (void*)t) != (void*)t);
     if (ptrhash_has(news, (void*)t) || ptrhash_has(news, (void*)jl_typeof(t)))
         return 1;
     if (!(image_base < (char*)t && (char*)t <= image_base + sizeof_sysimg))
@@ -52,25 +51,9 @@ int must_be_new_dt(jl_value_t *t, htable_t *news, char *image_base, size_t sizeo
     else if (jl_is_datatype(t)) {
         jl_datatype_t *dt = (jl_datatype_t*)t;
         assert(jl_astaggedvalue(dt->name)->bits.in_image && "type_in_worklist mistake?");
-        jl_datatype_t *super = dt->super;
-        // fast-path: check if super is in news, since then we must be new also
-        // (it is also possible that super is indeterminate or NULL right now,
-        // waiting for `t` to be resolved, then will be determined later as
-        // soon as possible afterwards).
-        while (super != NULL && super != jl_any_type) {
-            void *entry = ptrhash_get(news, (void*)super);
-            if (entry != HT_NOTFOUND) {
-                if (entry != (void*)super)
-                    return 1;
-                // A self-mapping marks an unresolved forward reference.
-                break;
-            }
-            if (!(image_base < (char*)super && (char*)super <= image_base + sizeof_sysimg))
-               break; // the rest must all be non-new
-            // otherwise super might be something that was not cached even though a later supertype might be
-            // for example while handling `Type{Mask{4, U} where U}`, if we have `Mask{4, U} <: AbstractSIMDVector{4}`
-            super = super->super;
-        }
+        // super says nothing here: an existing copy of `t` may have it deferred (unset),
+        // so the serializer left it unset unless it points outside the image
+        assert(dt->super == NULL || !(image_base < (char*)dt->super && (char*)dt->super <= image_base + sizeof_sysimg));
         jl_svec_t *tt = dt->parameters;
         size_t i, l = jl_svec_len(tt);
         for (i = 0; i < l; i++)
