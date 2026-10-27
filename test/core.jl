@@ -9510,6 +9510,26 @@ let A = LazySuperInProgress.A, Z = LazySuperInProgress.Z, U0 = LazySuperInProgre
     @test pointer_from_objref(Ksuper) == pointer_from_objref(K)
 end
 
+# A level of a self-referential definition (#61347) is instantiated from a
+# template whose own supertype is deferred. It is a complete type, not part of
+# a definition in progress: its field types are computed with it, and it does
+# not accumulate on the typename's `partial` list.
+module DeferredSuperLevels
+abstract type A{X} end
+struct F{T} <: A{F{Tuple{T}}}
+    x::T
+end
+end
+let F = DeferredSuperLevels.F, A = DeferredSuperLevels.A
+    level2 = supertype(F{Tuple{Int}}).parameters[1]
+    @test level2 === F{Tuple{Tuple{Int}}}
+    @test isdefined(level2, :types)
+    @test fieldtype(level2, 1) === Tuple{Tuple{Int}}
+    @test supertype(level2) === A{F{Tuple{Tuple{Tuple{Int}}}}}
+    tn = F.body.name
+    @test !isdefined(tn, :partial) || all(t -> t === nothing || Base.has_free_typevars(t), tn.partial)
+end
+
 # Method tables and dispatch caches keep their entries in insertion-ordered dicts that
 # grow by appending. Every entry must stay reachable as a dict grows through many sizes.
 module OrderedDictGrowth

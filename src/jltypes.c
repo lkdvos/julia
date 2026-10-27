@@ -2885,7 +2885,8 @@ static jl_value_t *inst_datatype_complete(jl_datatype_t *dt, jl_datatype_t *ndt,
     // so ordinary recursive types are unaffected. Field types stay eager: a
     // concrete type must publish with its layout, and only the supertype
     // declaration can force an infinite graph through abstract levels.
-    int defer_super = check && !istuple && !isnamedtuple && dt->super != NULL &&
+    int in_definition = primarydt->super == NULL;
+    int defer_super = !istuple && !isnamedtuple && !in_definition &&
         typename_on_stack(stack->prev, tn) &&
         typename_occurs_in((jl_value_t*)primarydt->super, tn);
     if (istuple || isnamedtuple) {
@@ -2894,8 +2895,19 @@ static jl_value_t *inst_datatype_complete(jl_datatype_t *dt, jl_datatype_t *ndt,
     else if (defer_super) {
         // deferred (see above)
     }
-    else if (dt->super) {
-        jl_value_t *super = inst_type_w_((jl_value_t*)dt->super, env, stack, check, nothrow, dcache);
+    else if (!in_definition) {
+        // from the declaration, as `jl_datatype_compute_super` does: `dt` may be
+        // a template whose own supertype is deferred (unset), or was computed
+        // while the definition still held a placeholder
+        size_t nparams = jl_svec_len(primarydt->parameters), pi;
+        jl_typeenv_t *penv = (jl_typeenv_t*)alloca(nparams * sizeof(jl_typeenv_t));
+        for (pi = 0; pi < nparams; pi++) {
+            penv[pi].var = (jl_tvar_t*)jl_svecref(primarydt->parameters, pi);
+            penv[pi].val = jl_svecref(ndt->parameters, pi);
+            penv[pi].prev = pi == 0 ? NULL : &penv[pi - 1];
+        }
+        jl_value_t *super = inst_type_w_((jl_value_t*)primarydt->super, nparams == 0 ? NULL : &penv[nparams - 1],
+                                         stack, check, nothrow, dcache);
         if (nothrow && super == NULL)
             return NULL;
         jl_gc_write(ndt, ndt->super, jl_datatype_t, (jl_datatype_t *)super);
@@ -2903,7 +2915,10 @@ static jl_value_t *inst_datatype_complete(jl_datatype_t *dt, jl_datatype_t *ndt,
     jl_svec_t *ftypes = dt->types;
     if (ftypes == NULL)
         ftypes = primarydt->types;
-    if (ftypes == NULL || dt->super == NULL) {
+    // `partial` is drained only when the definition completes, so a type made
+    // afterwards never goes there, even from a template whose supertype is
+    // deferred (unset): its supertype and field types are computed lazily
+    if (ftypes == NULL || in_definition) {
         // in the process of creating this type definition:
         // need to instantiate the super and types fields later
         if (tn->partial == NULL) {
