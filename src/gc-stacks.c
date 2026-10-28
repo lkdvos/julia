@@ -51,6 +51,67 @@ void free_stack(void *stkbuf, size_t bufsz) JL_NOTSAFEPOINT
 
 #else
 
+#if defined(_OS_LINUX_) && defined(MADV_NOHUGEPAGE)
+#include <dirent.h>
+
+// Return the selected mode of a THP "enabled" file, e.g. "madvise" for
+// "always [madvise] never", or NULL if it can't be read.
+static const char *thp_read_mode(const char *path, char *buf, size_t sz) JL_NOTSAFEPOINT
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return NULL;
+    const char *mode = NULL;
+    if (fgets(buf, sz, f)) {
+        char *l = strchr(buf, '[');
+        char *r = l ? strchr(l, ']') : NULL;
+        if (r) {
+            *r = '\0';
+            mode = l + 1;
+        }
+    }
+    fclose(f);
+    return mode;
+}
+
+// Whether THP applies to mappings without MADV_HUGEPAGE
+static int thp_unrequested_at(const char *root) JL_NOTSAFEPOINT
+{
+    char path[512], buf[128];
+    snprintf(path, sizeof(path), "%s/enabled", root);
+    const char *mode = thp_read_mode(path, buf, sizeof(buf));
+    int global_always = mode && strcmp(mode, "always") == 0;
+    DIR *dir = opendir(root);
+    if (dir == NULL)
+        return global_always;
+    int has_sizes = 0, unrequested = 0;
+    struct dirent *e;
+    while (!unrequested && (e = readdir(dir)) != NULL) {
+        if (strncmp(e->d_name, "hugepages-", 10) != 0)
+            continue;
+        has_sizes = 1;
+        snprintf(path, sizeof(path), "%s/%s/enabled", root, e->d_name);
+        mode = thp_read_mode(path, buf, sizeof(buf));
+        unrequested = mode && (strcmp(mode, "always") == 0 ||
+                               (global_always && strcmp(mode, "inherit") == 0));
+    }
+    closedir(dir);
+    return has_sizes ? unrequested : global_always;
+}
+
+static _Atomic(int) stack_nohugepage = -1;
+
+static int stack_needs_nohugepage(void) JL_NOTSAFEPOINT
+{
+    int v = jl_atomic_load_relaxed(&stack_nohugepage);
+    if (v < 0) {
+        v = thp_unrequested_at("/sys/kernel/mm/transparent_hugepage");
+        jl_atomic_store_relaxed(&stack_nohugepage, v);
+    }
+    return v;
+}
+#endif
+
 static void *malloc_stack(size_t bufsz) JL_NOTSAFEPOINT
 {
 # ifdef _OS_OPENBSD_
@@ -72,6 +133,11 @@ static void *malloc_stack(size_t bufsz) JL_NOTSAFEPOINT
         munmap(stk, bufsz);
         return MAP_FAILED;
     }
+#  if defined(_OS_LINUX_) && defined(MADV_NOHUGEPAGE)
+    // with THP, every touched stack would take a whole huge page
+    if (stack_needs_nohugepage())
+        madvise(stk, bufsz, MADV_NOHUGEPAGE);
+#  endif
 # endif
 
     jl_atomic_fetch_add_relaxed(&num_stack_mappings, 1);
