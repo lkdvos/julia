@@ -1043,6 +1043,15 @@ typedef struct {
 void jl_reinstantiate_inner_types(jl_datatype_t *t, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_datatype_t *jl_datatype_compute_super(jl_datatype_t *ndt JL_PROPAGATES_ROOT) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_datatype_super(jl_datatype_t *dt) JL_CANSAFEPOINT;
+// The supertype declared for the wrapper of `tn`, which has the same type-name as the
+// supertype of every instantiation of `tn`, but is set at definition and never deferred:
+// a walk that only follows type-names may use it without computing a lazy supertype.
+// NULL while the definition is in progress.
+STATIC_INLINE jl_datatype_t *jl_typename_super(jl_typename_t *tn JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
+{
+    jl_value_t *wrapper = tn->wrapper;
+    return wrapper == NULL ? NULL : ((jl_datatype_t*)jl_unwrap_unionall(wrapper))->super;
+}
 jl_value_t *jl_apply_type_deferred(jl_value_t *tc, jl_value_t **params, size_t n, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT;
 int equiv_type(jl_value_t *ta, jl_value_t *tb) JL_CANSAFEPOINT;
 int references_name(jl_value_t *p, jl_typename_t *name, int affects_layout, int freevars) JL_NOTSAFEPOINT;

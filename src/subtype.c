@@ -790,10 +790,9 @@ static int datatype_may_contain_types(jl_datatype_t *d) JL_NOTSAFEPOINT
     while (d != jl_any_type) {
         if (d == jl_anytype_type)
             return 1;
-        // raw read: a deferred (unset) supertype conservatively proves nothing
-        d = d->super;
+        d = jl_typename_super(d->name);
         if (d == NULL)
-            return 1;
+            return 1; // definition in progress
     }
     return 0;
 }
