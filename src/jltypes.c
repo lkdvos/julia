@@ -2548,6 +2548,22 @@ static int typename_occurs_in(jl_value_t *t, jl_typename_t *tn) JL_NOTSAFEPOINT
     return 0;
 }
 
+// whether the parameters of a level are all types other than `Union{}`, the
+// values for which `decl_total` proved its declaration. Inside a lazy supertype
+// computation this always holds: a new level's parameters are types built from
+// those of a checked level, and only a literal `Union{}` (instantiated, and
+// rejected, with the definition) could produce `Union{}`
+static int level_params_total(jl_datatype_t *dt) JL_NOTSAFEPOINT
+{
+    size_t i, np = jl_nparams(dt);
+    for (i = 0; i < np; i++) {
+        jl_value_t *p = jl_tparam(dt, i);
+        if (!jl_is_type(p) || p == jl_bottom_type)
+            return 0;
+    }
+    return 1;
+}
+
 // Is a supertype declaration valid for every value of the definition's
 // typevars? Deferring a supertype (see `inst_datatype_complete`) moves the
 // instantiation of a level from the construction of the type to the first
@@ -2556,11 +2572,11 @@ static int typename_occurs_in(jl_value_t *t, jl_typename_t *tn) JL_NOTSAFEPOINT
 // type application in it satisfies the applied wrapper's bounds universally
 // (the argument wrapped in `UnionAll`s over the free typevars, a lower or
 // dependent bound only when trivial), can't be an invalid `Tuple`, `NamedTuple` or
-// `GenericMemory`, the recursive applications give the deferred levels
-// parameters that are types other than `Union{}`, and the applied typenames'
-// own declarations hold too (recursively, a typename under consideration taken
-// as valid). Otherwise the level is instantiated eagerly and an invalid one
-// fails at construction.
+// `GenericMemory`, and the applied typenames' own declarations hold too
+// (recursively, a typename under consideration taken as valid). This holds for
+// typevars ranging over the types other than `Union{}`, which each deferred
+// level checks of its own parameters (`level_params_total`). Otherwise the level
+// is instantiated eagerly and an invalid one fails at construction.
 struct decl_stack_t {
     jl_typename_t *tn;
     struct decl_stack_t *prev;
@@ -2632,18 +2648,6 @@ static int decl_total(jl_value_t *t, jl_svec_t *vars, struct decl_stack_t *seen)
             if (dn == jl_genericmemory_typename || dn == jl_genericmemoryref_typename) {
                 if (!jl_is_symbol(jl_tparam(d, 0)) || !jl_is_addrspace(jl_tparam(d, 2)))
                     return 0;
-            }
-            for (struct decl_stack_t *s = seen; s != NULL; s = s->prev) {
-                if (s->tn == dn) {
-                    // the parameters of a deferred level: a type, never `Union{}`
-                    // (a `Tuple` field type), so the level's own declaration holds
-                    for (i = 0; i < np; i++) {
-                        jl_value_t *p = jl_tparam(d, i);
-                        if (!jl_is_datatype(p) && !jl_is_unionall(p))
-                            return 0;
-                    }
-                    break;
-                }
             }
             // a bound that depends on an earlier parameter (`D{X, Y<:X}`) has free
             // typevars, which `bound_total` does not prove
@@ -3093,7 +3097,7 @@ static jl_value_t *inst_datatype_complete(jl_datatype_t *dt, jl_datatype_t *ndt,
         else {
             int depth = typename_depth_on_stack(stack->prev, tn);
             if (depth > 0) {
-                defer_super = !cacheable || typename_decl_total(tn, NULL);
+                defer_super = !cacheable || (level_params_total(ndt) && typename_decl_total(tn, NULL));
                 if (!defer_super && depth >= 64) {
                     if (nothrow)
                         return NULL;

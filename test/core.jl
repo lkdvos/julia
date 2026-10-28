@@ -9543,9 +9543,10 @@ struct Total{T} <: C{A{Int}, Total{Tuple{T}}} end          # `A{Int}` is checked
 struct Dependent{T} <: D{Any, Dependent{Tuple{T}}} end     # valid, but a dependent bound isn't proven
 struct Partial{T} <: C{A{T}, Partial{Tuple{T}}} end        # `A{Tuple{T}}` is invalid at the next level
 struct Lower{T} <: L{Tuple{Vararg{T}}, Lower{Tuple{T}}} end # valid, but a lower bound isn't proven
+struct Shift{T, U} <: C{Shift{Tuple{U}, T}, Tuple{U}} end   # `T` reaches the `Tuple` one level down
 end
 let Total = DeferredSuperTotal.Total, Dependent = DeferredSuperTotal.Dependent,
-    Partial = DeferredSuperTotal.Partial, Lower = DeferredSuperTotal.Lower,
+    Partial = DeferredSuperTotal.Partial, Lower = DeferredSuperTotal.Lower, Shift = DeferredSuperTotal.Shift,
     A = DeferredSuperTotal.A, C = DeferredSuperTotal.C
     @test supertype(Total{Int}) === C{A{Int}, Total{Tuple{Int}}}
     @test !isdefined(Base.inferencebarrier(Total{Tuple{Int}}), :super)  # still deferred
@@ -9554,6 +9555,10 @@ let Total = DeferredSuperTotal.Total, Dependent = DeferredSuperTotal.Dependent,
     @test_throws TypeError Partial{String}
     @test_throws ErrorException Lower{Int}       # eager, and refused rather than instantiated without end
     @test_throws ErrorException Dependent{Int}
+    @test supertype(Shift{Int, Int}) === C{Shift{Tuple{Int}, Int}, Tuple{Int}}
+    @test !isdefined(Base.inferencebarrier(Shift{Tuple{Int}, Int}), :super)
+    @test supertype(Shift{Tuple{Int}, Int}) === C{Shift{Tuple{Int}, Tuple{Int}}, Tuple{Int}}
+    @test_throws ErrorException Shift{Union{}, Int}  # the level `Shift{Tuple{Int}, Union{}}` is eager
 end
 
 # Method tables and dispatch caches keep their entries in insertion-ordered dicts that
